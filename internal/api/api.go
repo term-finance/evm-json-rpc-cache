@@ -221,6 +221,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	uncachedRequests := []map[string]interface{}{}
 	uncachedRequestIDs := []interface{}{}
 	idToIndex := make(map[interface{}]int)
+	uncachedRequestsByID := make(map[interface{}]map[string]interface{})
 
 	for i, req := range requests {
 		id, ok := req["id"]
@@ -246,12 +247,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			cachedResponseBytes, err := s.Cache.Get(r.Context(), cacheKey)
 			if err == nil {
 				// Cache hit
-				var cachedResponse interface{}
+				var cachedResponse map[string]interface{}
 				if err := cbor.Unmarshal(cachedResponseBytes, &cachedResponse); err == nil {
-					// Convert the cachedResponse if it's a map[interface{}]interface{}
-					if m, ok := cachedResponse.(map[interface{}]interface{}); ok {
-						cachedResponse = convertMap(m)
-					}
+					// Inject the current request's 'id' into the cached response
+					cachedResponse["id"] = id
 					responses[i] = cachedResponse
 					continue
 				} else {
@@ -262,6 +261,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 		uncachedRequests = append(uncachedRequests, req)
 		uncachedRequestIDs = append(uncachedRequestIDs, id)
+		uncachedRequestsByID[id] = req
 	}
 
 	if len(uncachedRequests) > 0 {
@@ -329,13 +329,6 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			backendResponses = []interface{}{singleResponse}
 		}
 
-		// Map uncached request IDs to their requests
-		uncachedRequestsByID := make(map[interface{}]map[string]interface{})
-		for _, req := range uncachedRequests {
-			id := req["id"]
-			uncachedRequestsByID[id] = req
-		}
-
 		// Map backend responses by 'id'
 		backendResponsesByID := make(map[interface{}]interface{})
 		for _, backendResp := range backendResponses {
@@ -365,12 +358,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			}
 			responses[index] = backendResp
 
-			req, ok := uncachedRequestsByID[id]
-			if !ok {
-				s.logger.Error("Original request not found for id", zap.Any("id", id))
-				http.Error(w, "Internal server error", http.StatusInternalServerError)
-				return
-			}
+			req := uncachedRequestsByID[id]
 
 			method := req["method"].(string)
 			params := req["params"]
@@ -378,8 +366,21 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			shouldCache, cacheTTL := s.shouldCacheEndpoint(method)
 
 			if shouldCache {
-				// Cache the entire response using CBOR
-				cachedResponseBytes, err := cbor.Marshal(backendResp)
+				// Remove 'id' from the response before caching
+				respMap, ok := backendResp.(map[string]interface{})
+				if !ok {
+					s.logger.Error("Invalid response format")
+					continue
+				}
+				// Make a copy of the response without 'id'
+				cachedResp := make(map[string]interface{})
+				for k, v := range respMap {
+					if k != "id" {
+						cachedResp[k] = v
+					}
+				}
+				// Marshal the response without 'id'
+				cachedResponseBytes, err := cbor.Marshal(cachedResp)
 				if err == nil {
 					if err := s.Cache.Set(r.Context(), cacheKey, cachedResponseBytes, store.WithExpiration(cacheTTL)); err != nil {
 						s.logger.Error("Error setting cache for key", zap.String("key", cacheKey), zap.Error(err))
@@ -394,23 +395,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// Assemble and send the batch response
 	var responseBytes []byte
 	if isBatchRequest {
-		// Convert responses to ensure they can be marshaled to JSON
-		convertedResponses := make([]interface{}, len(responses))
-		for i, resp := range responses {
-			if m, ok := resp.(map[interface{}]interface{}); ok {
-				convertedResponses[i] = convertMap(m)
-			} else {
-				convertedResponses[i] = resp
-			}
-		}
-		responseBytes, err = json.Marshal(convertedResponses)
+		responseBytes, err = json.Marshal(responses)
 	} else {
-		// Convert single response if necessary
-		if m, ok := responses[0].(map[interface{}]interface{}); ok {
-			responseBytes, err = json.Marshal(convertMap(m))
-		} else {
-			responseBytes, err = json.Marshal(responses[0])
-		}
+		responseBytes, err = json.Marshal(responses[0])
 	}
 
 	if err != nil {
