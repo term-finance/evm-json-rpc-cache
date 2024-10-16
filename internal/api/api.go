@@ -3,6 +3,8 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"evm-cache/internal/config"
 	"evm-cache/internal/logging"
@@ -186,57 +188,70 @@ func (s *Server) Start() {
 
 // handleProxy forwards the incoming request to the backend using ReverseProxy with caching
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
-	// Generate a unique cache key based on the request
-	cacheKey := fmt.Sprintf("%s:%s", r.Method, r.URL.String())
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		s.logger.Error("Error reading request body", zap.Error(err))
+		http.Error(w, "Error reading request", http.StatusInternalServerError)
+		return
+	}
+	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 
-	shouldCache, cacheTTL := s.shouldCacheEndpoint(r)
+	var request struct {
+		Method string      `json:"method"`
+		Params interface{} `json:"params"`
+		ID     interface{} `json:"id"`
+	}
+
+	if err := json.Unmarshal(bodyBytes, &request); err != nil {
+		// If single request unmarshal fails, try batch request
+		var batchRequests []struct {
+			Method string      `json:"method"`
+			Params interface{} `json:"params"`
+			ID     interface{} `json:"id"`
+		}
+		if err := json.Unmarshal(bodyBytes, &batchRequests); err != nil {
+			s.logger.Error("Error unmarshaling request body", zap.Error(err))
+			http.Error(w, "Invalid request", http.StatusBadRequest)
+			return
+		}
+		// Use the first request in the batch for caching decision
+		if len(batchRequests) > 0 {
+			request = batchRequests[0]
+		}
+	}
+
+	// Generate a unique cache key based on the method and params
+	cacheKey := fmt.Sprintf("%s:%s", request.Method, hashParams(request.Params))
+
+	shouldCache, cacheTTL := s.shouldCacheEndpoint(request.Method)
 
 	if shouldCache {
 		// Attempt to retrieve the response from cache
 		cachedResponseBytes, err := s.Cache.Get(r.Context(), cacheKey)
 		if err == nil {
 			// cache hit
-			var cachedResponse CachedResponse
-			if err := json.Unmarshal(cachedResponseBytes, &cachedResponse); err != nil {
-				s.logger.Error("Error unmarshaling cached response", zap.Error(err))
-			} else {
-				for key, values := range cachedResponse.Header {
-					for _, value := range values {
-						w.Header().Add(key, value)
-					}
-				}
-				w.WriteHeader(cachedResponse.StatusCode)
-				_, writeErr := w.Write(cachedResponse.Body)
-				if writeErr != nil {
-					s.logger.Error("Error writing cached response", zap.Error(writeErr))
-				}
-				return
-			}
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(cachedResponseBytes)
+			return
 		}
 	}
 
 	// cache miss
 	rec := NewResponseRecorder(w)
-
 	s.Proxy.ServeHTTP(rec, r)
 
 	if shouldCache {
-
-		newCachedResponse := &CachedResponse{
-			StatusCode: rec.statusCode,
-			Header:     rec.header.Clone(),
-			Body:       rec.body.Bytes(),
-		}
-
-		serializedResponse, err := json.Marshal(newCachedResponse)
-		if err != nil {
-			s.logger.Error("Error serializing response for caching", zap.Error(err))
-		} else {
-			if err := s.Cache.Set(r.Context(), cacheKey, serializedResponse, store.WithExpiration(cacheTTL)); err != nil {
-				s.logger.Error("Error setting cache for key", zap.String("key", cacheKey), zap.Error(err))
-			}
+		// Cache the response
+		if err := s.Cache.Set(r.Context(), cacheKey, rec.body.Bytes(), store.WithExpiration(cacheTTL)); err != nil {
+			s.logger.Error("Error setting cache for key", zap.String("key", cacheKey), zap.Error(err))
 		}
 	}
+}
+
+func hashParams(params interface{}) string {
+	h := sha256.New()
+	h.Write([]byte(fmt.Sprintf("%v", params)))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 type responseRecorder struct {
@@ -306,70 +321,20 @@ func (s *Server) loggingMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func (s *Server) shouldCacheEndpoint(r *http.Request) (bool, time.Duration) {
-	var requestBody struct {
-		Method string `json:"method"`
-	}
-
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		s.logger.Error("Error reading request body", zap.Error(err))
-		return false, 0
-	}
-
-	// Restore the request body for further processing
-	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-
-	// Try to unmarshal as a single request
-	err = json.Unmarshal(bodyBytes, &requestBody)
-	if err != nil {
-		// If it fails, try to unmarshal as a batch request
-		var batchRequests []struct {
-			Method string `json:"method"`
-		}
-		err = json.Unmarshal(bodyBytes, &batchRequests)
-		if err != nil {
-			s.logger.Error("Error unmarshaling request body", zap.Error(err))
-			return false, 0
-		}
-		// For batch requests, we'll use the method of the first request
-		if len(batchRequests) > 0 {
-			requestBody.Method = batchRequests[0].Method
-		}
-	}
-
-	method := requestBody.Method
-
-	s.logger.Infow("Method called", "method", method)
-
+func (s *Server) shouldCacheEndpoint(method string) (bool, time.Duration) {
 	switch method {
-
 	case "eth_getTransactionByHash", "eth_getTransactionReceipt",
 		"eth_getTransactionByBlockHashAndIndex", "eth_getTransactionByBlockNumberAndIndex":
-		// For any tx data, it should be cached if it's over the required confirmations
-		if s.isTransactionConfirmed(r) {
-			return true, 365 * 24 * time.Hour
-		}
-		return false, 0
-
+		return true, 365 * 24 * time.Hour
 	case "eth_estimateGas", "eth_maxPriorityFeePerGas", "eth_gasPrice":
 		return true, s.Config.Blockchain.GasFeeTTL
-
 	case "eth_chainId":
 		return true, 365 * 24 * time.Hour
-
-	case "eth_blockNumber", "eth_getBalance",
-		"eth_getTransactionCount", "eth_sendRawTransaction":
+	case "eth_blockNumber", "eth_getBalance", "eth_getTransactionCount", "eth_sendRawTransaction":
 		return false, 0
-
 	case "eth_getBlockByHash", "eth_getBlockByNumber",
 		"eth_getBlockTransactionCountByHash", "eth_getBlockTransactionCountByNumber":
-		// cache for a long time if it's over 15 confirmations
-		if s.isBlockFinalized(r) {
-			return true, 365 * 24 * time.Hour
-		}
-		return false, 0
-
+		return true, 365 * 24 * time.Hour
 	default:
 		return false, 0
 	}
