@@ -20,6 +20,8 @@ import (
 
 	"math/big"
 
+	"compress/gzip"
+
 	"github.com/allegro/bigcache/v3"
 	"github.com/eko/gocache/lib/v4/cache"
 	"github.com/eko/gocache/lib/v4/store"
@@ -244,6 +246,24 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	rec := NewResponseRecorder(w)
 	s.Proxy.ServeHTTP(rec, r)
 
+	// Check for compressed response
+	if rec.header.Get("Content-Encoding") == "gzip" {
+		gzipReader, err := gzip.NewReader(bytes.NewReader(rec.body.Bytes()))
+		if err != nil {
+			s.logger.Error("Error creating gzip reader", zap.Error(err))
+			http.Error(w, "Error decompressing response", http.StatusInternalServerError)
+			return
+		}
+		decompressedBody, err := io.ReadAll(gzipReader)
+		if err != nil {
+			s.logger.Error("Error reading decompressed data", zap.Error(err))
+			http.Error(w, "Error decompressing response", http.StatusInternalServerError)
+			return
+		}
+		gzipReader.Close()
+		rec.body = bytes.NewBuffer(decompressedBody)
+	}
+
 	if shouldCache {
 		// Cache the response
 		var responseToCache interface{}
@@ -285,12 +305,11 @@ type responseRecorder struct {
 func (r *responseRecorder) WriteHeader(code int) {
 	r.statusCode = code
 	r.header = r.Header().Clone()
-	r.ResponseWriter.WriteHeader(code)
 }
 
 func (r *responseRecorder) Write(b []byte) (int, error) {
 	r.body.Write(b)
-	return r.ResponseWriter.Write(b)
+	return len(b), nil
 }
 
 func NewResponseRecorder(w http.ResponseWriter) *responseRecorder {
