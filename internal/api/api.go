@@ -273,6 +273,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Create a new request to send to the backend
 		backendReq, err := http.NewRequest("POST", s.Config.Backend.URL, bytes.NewBuffer(backendBodyBytes))
 		if err != nil {
 			s.logger.Error("Error creating backend request", zap.Error(err))
@@ -328,6 +329,13 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			backendResponses = []interface{}{singleResponse}
 		}
 
+		// Map uncached request IDs to their requests
+		uncachedRequestsByID := make(map[interface{}]map[string]interface{})
+		for _, req := range uncachedRequests {
+			id := req["id"]
+			uncachedRequestsByID[id] = req
+		}
+
 		// Map backend responses by 'id'
 		backendResponsesByID := make(map[interface{}]interface{})
 		for _, backendResp := range backendResponses {
@@ -357,8 +365,15 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			}
 			responses[index] = backendResp
 
-			method := uncachedRequests[index]["method"].(string)
-			params := uncachedRequests[index]["params"]
+			req, ok := uncachedRequestsByID[id]
+			if !ok {
+				s.logger.Error("Original request not found for id", zap.Any("id", id))
+				http.Error(w, "Internal server error", http.StatusInternalServerError)
+				return
+			}
+
+			method := req["method"].(string)
+			params := req["params"]
 			cacheKey := fmt.Sprintf("%s:%s", method, hashParams(params))
 			shouldCache, cacheTTL := s.shouldCacheEndpoint(method)
 
