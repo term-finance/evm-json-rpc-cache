@@ -1,6 +1,8 @@
 # EVM JSON RPC Cache
 
-This program caches requests 
+This program caches requests obtained from interacting with EVM's json rpc. 
+
+It is very useful for indexers/programs which need to make repeated historical calls. It reduces strain on node and saves api credits.
 
 ## Caching Mechanism
 
