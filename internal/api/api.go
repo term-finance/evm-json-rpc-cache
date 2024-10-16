@@ -307,7 +307,6 @@ func (s *Server) loggingMiddleware(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (s *Server) shouldCacheEndpoint(r *http.Request) (bool, time.Duration) {
-	// Extract the method from the request body
 	var requestBody struct {
 		Method string `json:"method"`
 	}
@@ -321,10 +320,22 @@ func (s *Server) shouldCacheEndpoint(r *http.Request) (bool, time.Duration) {
 	// Restore the request body for further processing
 	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 
+	// Try to unmarshal as a single request
 	err = json.Unmarshal(bodyBytes, &requestBody)
 	if err != nil {
-		s.logger.Error("Error unmarshaling request body", zap.Error(err))
-		return false, 0
+		// If it fails, try to unmarshal as a batch request
+		var batchRequests []struct {
+			Method string `json:"method"`
+		}
+		err = json.Unmarshal(bodyBytes, &batchRequests)
+		if err != nil {
+			s.logger.Error("Error unmarshaling request body", zap.Error(err))
+			return false, 0
+		}
+		// For batch requests, we'll use the method of the first request
+		if len(batchRequests) > 0 {
+			requestBody.Method = batchRequests[0].Method
+		}
 	}
 
 	method := requestBody.Method
