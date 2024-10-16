@@ -323,21 +323,29 @@ type responseRecorder struct {
 	body       *bytes.Buffer
 }
 
+func (r *responseRecorder) Header() http.Header {
+	if r.header == nil {
+		r.header = make(http.Header)
+	}
+	return r.header
+}
+
 func (r *responseRecorder) WriteHeader(code int) {
-	r.statusCode = code
-	r.header = r.Header().Clone()
+	if r.statusCode == 0 {
+		r.statusCode = code
+	}
 }
 
 func (r *responseRecorder) Write(b []byte) (int, error) {
-	r.body.Write(b)
-	return len(b), nil
+	return r.body.Write(b)
 }
 
 func NewResponseRecorder(w http.ResponseWriter) *responseRecorder {
 	return &responseRecorder{
-		header:     make(http.Header),
-		body:       &bytes.Buffer{},
-		statusCode: http.StatusOK,
+		ResponseWriter: w,
+		header:         make(http.Header),
+		body:           &bytes.Buffer{},
+		statusCode:     http.StatusOK,
 	}
 }
 
