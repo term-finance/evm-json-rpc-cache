@@ -29,6 +29,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/fxamacker/cbor/v2"
 	"go.uber.org/zap"
 )
 
@@ -198,126 +199,180 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 
-	var request struct {
-		Method string      `json:"method"`
-		Params interface{} `json:"params"`
-		ID     interface{} `json:"id"`
-	}
+	var requests []map[string]interface{}
+	var isBatchRequest bool
 
-	if err := json.Unmarshal(bodyBytes, &request); err != nil {
-		// If single request unmarshal fails, try batch request
-		var batchRequests []struct {
-			Method string      `json:"method"`
-			Params interface{} `json:"params"`
-			ID     interface{} `json:"id"`
-		}
-		if err := json.Unmarshal(bodyBytes, &batchRequests); err != nil {
+	// Attempt to unmarshal as batch request
+	if err := json.Unmarshal(bodyBytes, &requests); err == nil {
+		isBatchRequest = true
+	} else {
+		// Attempt to unmarshal as single request
+		var singleRequest map[string]interface{}
+		if err := json.Unmarshal(bodyBytes, &singleRequest); err != nil {
 			s.logger.Error("Error unmarshaling request body", zap.Error(err))
 			http.Error(w, "Invalid request", http.StatusBadRequest)
 			return
 		}
-		// Use the first request in the batch for caching decision
-		if len(batchRequests) > 0 {
-			request = batchRequests[0]
-		}
+		requests = []map[string]interface{}{singleRequest}
+		isBatchRequest = false
 	}
 
-	// Generate a unique cache key based on the method and params
-	cacheKey := fmt.Sprintf("%s:%s", request.Method, hashParams(request.Params))
+	responses := make([]interface{}, len(requests))
+	uncachedRequests := []map[string]interface{}{}
+	uncachedRequestIndices := []int{}
 
-	shouldCache, cacheTTL := s.shouldCacheEndpoint(request.Method)
-
-	if shouldCache {
-		// Attempt to retrieve the response from cache
-		cachedResponseBytes, err := s.Cache.Get(r.Context(), cacheKey)
-		if err == nil {
-			// Cache hit
-			var cachedResponse map[string]interface{}
-			if err := json.Unmarshal(cachedResponseBytes, &cachedResponse); err == nil {
-				// Inject the current request's 'id'
-				cachedResponse["id"] = request.ID
-				responseBytes, err := json.Marshal(cachedResponse)
-				if err == nil {
-					w.Header().Set("Content-Type", "application/json")
-					w.Write(responseBytes)
-					return
-				}
-				s.logger.Error("Error marshaling cached response", zap.Error(err))
-			}
-			s.logger.Error("Error unmarshaling cached response", zap.Error(err))
-		}
-	}
-
-	// cache miss
-	rec := NewResponseRecorder(w)
-	s.Proxy.ServeHTTP(rec, r)
-
-	// Check for compressed response
-	if rec.header.Get("Content-Encoding") == "gzip" {
-		gzipReader, err := gzip.NewReader(bytes.NewReader(rec.body.Bytes()))
-		if err != nil {
-			s.logger.Error("Error creating gzip reader", zap.Error(err))
-			http.Error(w, "Error decompressing response", http.StatusInternalServerError)
+	for i, req := range requests {
+		method, ok := req["method"].(string)
+		if !ok {
+			s.logger.Error("Invalid method in request")
+			http.Error(w, "Invalid request", http.StatusBadRequest)
 			return
 		}
-		decompressedBody, err := io.ReadAll(gzipReader)
-		if err != nil {
-			s.logger.Error("Error reading decompressed data", zap.Error(err))
-			http.Error(w, "Error decompressing response", http.StatusInternalServerError)
-			return
-		}
-		gzipReader.Close()
-		rec.body = bytes.NewBuffer(decompressedBody)
-	}
+		params := req["params"]
 
-	if shouldCache {
-		// Cache the response
-		var responseToCache map[string]interface{}
-		if err := json.Unmarshal(rec.body.Bytes(), &responseToCache); err == nil {
-			// Remove the 'id' field before caching
-			delete(responseToCache, "id")
-			cachedResponseBytes, err := json.Marshal(responseToCache)
+		cacheKey := fmt.Sprintf("%s:%s", method, hashParams(params))
+		shouldCache, _ := s.shouldCacheEndpoint(method)
+
+		if shouldCache {
+			cachedResponseBytes, err := s.Cache.Get(r.Context(), cacheKey)
 			if err == nil {
-				if err := s.Cache.Set(r.Context(), cacheKey, cachedResponseBytes, store.WithExpiration(cacheTTL)); err != nil {
-					s.logger.Error("Error setting cache for key", zap.String("key", cacheKey), zap.Error(err))
+				// Cache hit
+				var cachedResponse interface{}
+				if err := cbor.Unmarshal(cachedResponseBytes, &cachedResponse); err == nil {
+					// Convert the cachedResponse if it's a map[interface{}]interface{}
+					if m, ok := cachedResponse.(map[interface{}]interface{}); ok {
+						cachedResponse = convertMap(m)
+					}
+					responses[i] = cachedResponse
+					continue
+				} else {
+					s.logger.Error("Error unmarshaling cached CBOR response", zap.Error(err))
 				}
-			} else {
-				s.logger.Error("Error marshaling response for caching", zap.Error(err))
 			}
-		} else {
-			s.logger.Error("Error unmarshaling response for caching", zap.Error(err))
 		}
+
+		uncachedRequests = append(uncachedRequests, req)
+		uncachedRequestIndices = append(uncachedRequestIndices, i)
 	}
 
-	// Inject the current request's 'id' into the response
-	var responseJSON map[string]interface{}
-	if err := json.Unmarshal(rec.body.Bytes(), &responseJSON); err == nil {
-		responseJSON["id"] = request.ID
-		responseBytes, err := json.Marshal(responseJSON)
-		if err == nil {
-			// Write the response to the client
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(rec.statusCode)
-			w.Write(responseBytes)
+	if len(uncachedRequests) > 0 {
+		// Send uncached requests to backend
+		backendBodyBytes, err := json.Marshal(uncachedRequests)
+		if err != nil {
+			s.logger.Error("Error marshaling uncached requests", zap.Error(err))
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
-		s.logger.Error("Error marshaling response", zap.Error(err))
-	}
-	s.logger.Error("Error unmarshaling response", zap.Error(err))
 
-	// Write the original response if there was an error
-	w.WriteHeader(rec.statusCode)
-	w.Write(rec.body.Bytes())
+		// Create a new request to send to the backend
+		backendReq, err := http.NewRequest(r.Method, r.URL.String(), bytes.NewBuffer(backendBodyBytes))
+		if err != nil {
+			s.logger.Error("Error creating backend request", zap.Error(err))
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+		backendReq.Header = r.Header.Clone()
+
+		// Use a response recorder to capture the backend's response
+		rec := NewResponseRecorder()
+		s.Proxy.ServeHTTP(rec, backendReq)
+
+		// Process the backend response
+		responseBody := rec.body.Bytes()
+		if rec.header.Get("Content-Encoding") == "gzip" {
+			gzipReader, err := gzip.NewReader(bytes.NewReader(responseBody))
+			if err != nil {
+				s.logger.Error("Error creating gzip reader", zap.Error(err))
+				http.Error(w, "Error decompressing response", http.StatusInternalServerError)
+				return
+			}
+			decompressedBody, err := io.ReadAll(gzipReader)
+			if err != nil {
+				s.logger.Error("Error reading decompressed data", zap.Error(err))
+				http.Error(w, "Error decompressing response", http.StatusInternalServerError)
+				return
+			}
+			gzipReader.Close()
+			responseBody = decompressedBody
+		}
+
+		var backendResponses []interface{}
+		if err := json.Unmarshal(responseBody, &backendResponses); err != nil {
+			s.logger.Error("Error unmarshaling backend response", zap.Error(err))
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		if len(backendResponses) != len(uncachedRequests) {
+			s.logger.Error("Mismatch in number of backend responses")
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		for i, backendResp := range backendResponses {
+			index := uncachedRequestIndices[i]
+			responses[index] = backendResp
+
+			method := uncachedRequests[i]["method"].(string)
+			params := uncachedRequests[i]["params"]
+			cacheKey := fmt.Sprintf("%s:%s", method, hashParams(params))
+			shouldCache, cacheTTL := s.shouldCacheEndpoint(method)
+
+			if shouldCache {
+				// Cache the entire response using CBOR
+				cachedResponseBytes, err := cbor.Marshal(backendResp)
+				if err == nil {
+					if err := s.Cache.Set(r.Context(), cacheKey, cachedResponseBytes, store.WithExpiration(cacheTTL)); err != nil {
+						s.logger.Error("Error setting cache for key", zap.String("key", cacheKey), zap.Error(err))
+					}
+				} else {
+					s.logger.Error("Error marshaling response for caching", zap.Error(err))
+				}
+			}
+		}
+	}
+
+	// Assemble and send the batch response
+	var responseBytes []byte
+	if isBatchRequest {
+		// Convert responses to ensure they can be marshaled to JSON
+		convertedResponses := make([]interface{}, len(responses))
+		for i, resp := range responses {
+			if m, ok := resp.(map[interface{}]interface{}); ok {
+				convertedResponses[i] = convertMap(m)
+			} else {
+				convertedResponses[i] = resp
+			}
+		}
+		responseBytes, err = json.Marshal(convertedResponses)
+	} else {
+		// Convert single response if necessary
+		if m, ok := responses[0].(map[interface{}]interface{}); ok {
+			responseBytes, err = json.Marshal(convertMap(m))
+		} else {
+			responseBytes, err = json.Marshal(responses[0])
+		}
+	}
+
+	if err != nil {
+		s.logger.Error("Error marshaling response", zap.Error(err))
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(responseBytes)
 }
 
 func hashParams(params interface{}) string {
+	// Convert params to a sorted JSON string to ensure consistent hashing
+	paramsJSON, _ := json.Marshal(params)
 	h := sha256.New()
-	h.Write([]byte(fmt.Sprintf("%v", params)))
+	h.Write(paramsJSON)
 	return hex.EncodeToString(h.Sum(nil))
 }
 
 type responseRecorder struct {
-	http.ResponseWriter
 	statusCode int
 	header     http.Header
 	body       *bytes.Buffer
@@ -340,12 +395,11 @@ func (r *responseRecorder) Write(b []byte) (int, error) {
 	return r.body.Write(b)
 }
 
-func NewResponseRecorder(w http.ResponseWriter) *responseRecorder {
+func NewResponseRecorder() *responseRecorder {
 	return &responseRecorder{
-		ResponseWriter: w,
-		header:         make(http.Header),
-		body:           &bytes.Buffer{},
-		statusCode:     http.StatusOK,
+		header:     make(http.Header),
+		body:       &bytes.Buffer{},
+		statusCode: http.StatusOK,
 	}
 }
 
@@ -523,4 +577,48 @@ func (s *Server) isTransactionConfirmed(r *http.Request) bool {
 
 	latestBlock := s.latestBlockNum.Load()
 	return latestBlock-receipt.BlockNumber.Uint64() >= uint64(s.Config.Blockchain.Confirmations)
+}
+
+func convertMap(m map[interface{}]interface{}) map[string]interface{} {
+	result := make(map[string]interface{})
+	for k, v := range m {
+		switch key := k.(type) {
+		case string:
+			switch val := v.(type) {
+			case map[interface{}]interface{}:
+				result[key] = convertMap(val)
+			case []interface{}:
+				result[key] = convertSlice(val)
+			default:
+				result[key] = val
+			}
+		default:
+			// If the key is not a string, convert it to a string
+			strKey := fmt.Sprintf("%v", key)
+			switch val := v.(type) {
+			case map[interface{}]interface{}:
+				result[strKey] = convertMap(val)
+			case []interface{}:
+				result[strKey] = convertSlice(val)
+			default:
+				result[strKey] = val
+			}
+		}
+	}
+	return result
+}
+
+func convertSlice(s []interface{}) []interface{} {
+	result := make([]interface{}, len(s))
+	for i, v := range s {
+		switch val := v.(type) {
+		case map[interface{}]interface{}:
+			result[i] = convertMap(val)
+		case []interface{}:
+			result[i] = convertSlice(val)
+		default:
+			result[i] = val
+		}
+	}
+	return result
 }
