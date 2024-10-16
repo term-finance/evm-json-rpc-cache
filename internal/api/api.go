@@ -231,12 +231,18 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// Attempt to retrieve the response from cache
 		cachedResponseBytes, err := s.Cache.Get(r.Context(), cacheKey)
 		if err == nil {
-			// cache hit
-			var cachedResponse json.RawMessage
+			// Cache hit
+			var cachedResponse map[string]interface{}
 			if err := json.Unmarshal(cachedResponseBytes, &cachedResponse); err == nil {
-				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(cachedResponse)
-				return
+				// Inject the current request's 'id'
+				cachedResponse["id"] = request.ID
+				responseBytes, err := json.Marshal(cachedResponse)
+				if err == nil {
+					w.Header().Set("Content-Type", "application/json")
+					w.Write(responseBytes)
+					return
+				}
+				s.logger.Error("Error marshaling cached response", zap.Error(err))
 			}
 			s.logger.Error("Error unmarshaling cached response", zap.Error(err))
 		}
@@ -266,8 +272,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	if shouldCache {
 		// Cache the response
-		var responseToCache interface{}
+		var responseToCache map[string]interface{}
 		if err := json.Unmarshal(rec.body.Bytes(), &responseToCache); err == nil {
+			// Remove the 'id' field before caching
+			delete(responseToCache, "id")
 			cachedResponseBytes, err := json.Marshal(responseToCache)
 			if err == nil {
 				if err := s.Cache.Set(r.Context(), cacheKey, cachedResponseBytes, store.WithExpiration(cacheTTL)); err != nil {
@@ -281,11 +289,24 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Write the response
-	w.WriteHeader(rec.statusCode)
-	for k, v := range rec.header {
-		w.Header()[k] = v
+	// Inject the current request's 'id' into the response
+	var responseJSON map[string]interface{}
+	if err := json.Unmarshal(rec.body.Bytes(), &responseJSON); err == nil {
+		responseJSON["id"] = request.ID
+		responseBytes, err := json.Marshal(responseJSON)
+		if err == nil {
+			// Write the response to the client
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(rec.statusCode)
+			w.Write(responseBytes)
+			return
+		}
+		s.logger.Error("Error marshaling response", zap.Error(err))
 	}
+	s.logger.Error("Error unmarshaling response", zap.Error(err))
+
+	// Write the original response if there was an error
+	w.WriteHeader(rec.statusCode)
 	w.Write(rec.body.Bytes())
 }
 
@@ -314,10 +335,9 @@ func (r *responseRecorder) Write(b []byte) (int, error) {
 
 func NewResponseRecorder(w http.ResponseWriter) *responseRecorder {
 	return &responseRecorder{
-		ResponseWriter: w,
-		header:         make(http.Header),
-		body:           &bytes.Buffer{},
-		statusCode:     http.StatusOK,
+		header:     make(http.Header),
+		body:       &bytes.Buffer{},
+		statusCode: http.StatusOK,
 	}
 }
 
