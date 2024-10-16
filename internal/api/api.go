@@ -248,6 +248,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			if err == nil {
 				// Cache hit
 				var cachedResponse map[string]interface{}
+
+				// Manually decode CBOR into map[string]interface{}
 				if err := cbor.Unmarshal(cachedResponseBytes, &cachedResponse); err == nil {
 					// Inject the current request's 'id' into the cached response
 					cachedResponse["id"] = id
@@ -390,6 +392,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+	}
+
+	// Before marshaling the responses, convert them to have string keys
+	for i, resp := range responses {
+		responses[i] = convertToStringKeys(resp)
 	}
 
 	// Assemble and send the batch response
@@ -625,31 +632,28 @@ func (s *Server) isTransactionConfirmed(r *http.Request) bool {
 	return latestBlock-receipt.BlockNumber.Uint64() >= uint64(s.Config.Blockchain.Confirmations)
 }
 
+func convertToStringKeys(i interface{}) interface{} {
+	switch v := i.(type) {
+	case map[interface{}]interface{}:
+		return convertMap(v)
+	case []interface{}:
+		return convertSlice(v)
+	case map[string]interface{}:
+		// Also need to process nested structures
+		for key, val := range v {
+			v[key] = convertToStringKeys(val)
+		}
+		return v
+	default:
+		return v
+	}
+}
+
 func convertMap(m map[interface{}]interface{}) map[string]interface{} {
 	result := make(map[string]interface{})
 	for k, v := range m {
-		switch key := k.(type) {
-		case string:
-			switch val := v.(type) {
-			case map[interface{}]interface{}:
-				result[key] = convertMap(val)
-			case []interface{}:
-				result[key] = convertSlice(val)
-			default:
-				result[key] = val
-			}
-		default:
-			// If the key is not a string, convert it to a string
-			strKey := fmt.Sprintf("%v", key)
-			switch val := v.(type) {
-			case map[interface{}]interface{}:
-				result[strKey] = convertMap(val)
-			case []interface{}:
-				result[strKey] = convertSlice(val)
-			default:
-				result[strKey] = val
-			}
-		}
+		keyStr := fmt.Sprintf("%v", k)
+		result[keyStr] = convertToStringKeys(v)
 	}
 	return result
 }
@@ -657,14 +661,7 @@ func convertMap(m map[interface{}]interface{}) map[string]interface{} {
 func convertSlice(s []interface{}) []interface{} {
 	result := make([]interface{}, len(s))
 	for i, v := range s {
-		switch val := v.(type) {
-		case map[interface{}]interface{}:
-			result[i] = convertMap(val)
-		case []interface{}:
-			result[i] = convertSlice(val)
-		default:
-			result[i] = val
-		}
+		result[i] = convertToStringKeys(v)
 	}
 	return result
 }
