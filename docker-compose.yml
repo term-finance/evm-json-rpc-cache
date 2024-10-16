@@ -1,0 +1,16 @@
+services:
+  evm-json-rpc-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8999:8999"
+    volumes:
+      - ./logs:/logs
+      - ./config/config.yml:/config/config.yml:ro
+    command: [ "-config", "/config/config.yml" ]
+    restart: always
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
