@@ -344,6 +344,9 @@ func (s *Server) shouldCacheEndpoint(r *http.Request) (bool, time.Duration) {
 	case "eth_estimateGas", "eth_maxPriorityFeePerGas", "eth_gasPrice":
 		return true, s.Config.Blockchain.GasFeeTTL
 
+	case "eth_chainId":
+		return true, 365 * 24 * time.Hour
+
 	case "eth_blockNumber", "eth_getBalance",
 		"eth_getTransactionCount", "eth_sendRawTransaction":
 		return false, 0
