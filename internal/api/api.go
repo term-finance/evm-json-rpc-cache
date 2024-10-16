@@ -230,9 +230,13 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		cachedResponseBytes, err := s.Cache.Get(r.Context(), cacheKey)
 		if err == nil {
 			// cache hit
-			w.Header().Set("Content-Type", "application/json")
-			w.Write(cachedResponseBytes)
-			return
+			var cachedResponse json.RawMessage
+			if err := json.Unmarshal(cachedResponseBytes, &cachedResponse); err == nil {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(cachedResponse)
+				return
+			}
+			s.logger.Error("Error unmarshaling cached response", zap.Error(err))
 		}
 	}
 
@@ -242,10 +246,27 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	if shouldCache {
 		// Cache the response
-		if err := s.Cache.Set(r.Context(), cacheKey, rec.body.Bytes(), store.WithExpiration(cacheTTL)); err != nil {
-			s.logger.Error("Error setting cache for key", zap.String("key", cacheKey), zap.Error(err))
+		var responseToCache interface{}
+		if err := json.Unmarshal(rec.body.Bytes(), &responseToCache); err == nil {
+			cachedResponseBytes, err := json.Marshal(responseToCache)
+			if err == nil {
+				if err := s.Cache.Set(r.Context(), cacheKey, cachedResponseBytes, store.WithExpiration(cacheTTL)); err != nil {
+					s.logger.Error("Error setting cache for key", zap.String("key", cacheKey), zap.Error(err))
+				}
+			} else {
+				s.logger.Error("Error marshaling response for caching", zap.Error(err))
+			}
+		} else {
+			s.logger.Error("Error unmarshaling response for caching", zap.Error(err))
 		}
 	}
+
+	// Write the response
+	w.WriteHeader(rec.statusCode)
+	for k, v := range rec.header {
+		w.Header()[k] = v
+	}
+	w.Write(rec.body.Bytes())
 }
 
 func hashParams(params interface{}) string {
