@@ -219,9 +219,18 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	responses := make([]interface{}, len(requests))
 	uncachedRequests := []map[string]interface{}{}
-	uncachedRequestIndices := []int{}
+	uncachedRequestIDs := []interface{}{}
+	idToIndex := make(map[interface{}]int)
 
 	for i, req := range requests {
+		id, ok := req["id"]
+		if !ok {
+			s.logger.Error("Missing 'id' in request")
+			http.Error(w, "Invalid request: missing 'id'", http.StatusBadRequest)
+			return
+		}
+		idToIndex[id] = i
+
 		method, ok := req["method"].(string)
 		if !ok {
 			s.logger.Error("Invalid method in request")
@@ -252,7 +261,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 
 		uncachedRequests = append(uncachedRequests, req)
-		uncachedRequestIndices = append(uncachedRequestIndices, i)
+		uncachedRequestIDs = append(uncachedRequestIDs, id)
 	}
 
 	if len(uncachedRequests) > 0 {
@@ -264,8 +273,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Create a new request to send to the backend
-		backendReq, err := http.NewRequest(r.Method, r.URL.String(), bytes.NewBuffer(backendBodyBytes))
+		backendReq, err := http.NewRequest("POST", s.Config.Backend.URL, bytes.NewBuffer(backendBodyBytes))
 		if err != nil {
 			s.logger.Error("Error creating backend request", zap.Error(err))
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
@@ -273,13 +281,25 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		backendReq.Header = r.Header.Clone()
 
-		// Use a response recorder to capture the backend's response
-		rec := NewResponseRecorder()
-		s.Proxy.ServeHTTP(rec, backendReq)
+		// Send the request to the backend
+		client := &http.Client{}
+		resp, err := client.Do(backendReq)
+		if err != nil {
+			s.logger.Error("Error sending request to backend", zap.Error(err))
+			http.Error(w, "Error connecting to backend", http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
 
-		// Process the backend response
-		responseBody := rec.body.Bytes()
-		if rec.header.Get("Content-Encoding") == "gzip" {
+		// Read and process the backend response
+		responseBody, err := io.ReadAll(resp.Body)
+		if err != nil {
+			s.logger.Error("Error reading backend response", zap.Error(err))
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		if resp.Header.Get("Content-Encoding") == "gzip" {
 			gzipReader, err := gzip.NewReader(bytes.NewReader(responseBody))
 			if err != nil {
 				s.logger.Error("Error creating gzip reader", zap.Error(err))
@@ -298,23 +318,47 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 		var backendResponses []interface{}
 		if err := json.Unmarshal(responseBody, &backendResponses); err != nil {
-			s.logger.Error("Error unmarshaling backend response", zap.Error(err))
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-			return
+			// Handle single response
+			var singleResponse interface{}
+			if err := json.Unmarshal(responseBody, &singleResponse); err != nil {
+				s.logger.Error("Error unmarshaling backend response", zap.Error(err))
+				http.Error(w, "Internal server error", http.StatusInternalServerError)
+				return
+			}
+			backendResponses = []interface{}{singleResponse}
 		}
 
-		if len(backendResponses) != len(uncachedRequests) {
-			s.logger.Error("Mismatch in number of backend responses")
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-			return
+		// Map backend responses by 'id'
+		backendResponsesByID := make(map[interface{}]interface{})
+		for _, backendResp := range backendResponses {
+			respMap, ok := backendResp.(map[string]interface{})
+			if !ok {
+				s.logger.Error("Invalid response format")
+				http.Error(w, "Internal server error", http.StatusInternalServerError)
+				return
+			}
+			id, ok := respMap["id"]
+			if !ok {
+				s.logger.Error("Missing 'id' in backend response")
+				http.Error(w, "Invalid backend response: missing 'id'", http.StatusInternalServerError)
+				return
+			}
+			backendResponsesByID[id] = backendResp
 		}
 
-		for i, backendResp := range backendResponses {
-			index := uncachedRequestIndices[i]
+		// Place backend responses into the correct positions
+		for _, id := range uncachedRequestIDs {
+			index := idToIndex[id]
+			backendResp, ok := backendResponsesByID[id]
+			if !ok {
+				s.logger.Error("Received response with unknown id", zap.Any("id", id))
+				http.Error(w, "Invalid backend response: unknown 'id'", http.StatusInternalServerError)
+				return
+			}
 			responses[index] = backendResp
 
-			method := uncachedRequests[i]["method"].(string)
-			params := uncachedRequests[i]["params"]
+			method := uncachedRequests[index]["method"].(string)
+			params := uncachedRequests[index]["params"]
 			cacheKey := fmt.Sprintf("%s:%s", method, hashParams(params))
 			shouldCache, cacheTTL := s.shouldCacheEndpoint(method)
 
