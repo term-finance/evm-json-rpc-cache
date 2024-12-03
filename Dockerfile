@@ -4,7 +4,7 @@ WORKDIR /code
 COPY . .
 RUN make build
 
-FROM cgr.dev/chainguard/glibc-dynamic AS bluefin
+FROM cgr.dev/chainguard/glibc-dynamic AS evm-cache
 COPY --from=build /code/proxy /bin/
 
 VOLUME ["/data", "/config"]
