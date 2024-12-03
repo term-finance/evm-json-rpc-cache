@@ -54,10 +54,14 @@ server:
   listenPort: 8080
 
 backend:
-  url: "https://mainnet.infura.io/v3/API_KEY"
+  urls:
+    - "https://mainnet.infura.io/v3/API_KEY"
+    - "https://mainnet.infura.io/v3/API_KEY_2"
 
 ws_backend:
-  url: "wss://mainnet.infura.io/ws/v3/API_KEY"
+  urls:
+    - "wss://mainnet.infura.io/ws/v3/API_KEY"
+    - "wss://mainnet.infura.io/ws/v3/API_KEY_2"
 
 blockchain:
   confirmations: 15
