@@ -47,32 +47,41 @@ type Server struct {
 	latestBlockNum atomic.Uint64
 	ethClient      *ethclient.Client
 	logger         *zap.SugaredLogger
+	urlManager     *URLManager
+	wsURLManager   *URLManager
 }
 
 func NewServer(cfg *config.Config) (*Server, error) {
 	logger := logging.GetLogger()
 
-	backendURL, err := url.Parse(cfg.Backend.URL)
-	if err != nil {
-		return nil, fmt.Errorf("invalid backend URL %s: %v", cfg.Backend.URL, err)
+	urlManager := NewURLManager(cfg.Backend.URLs, logger, "backend")
+	wsURLManager := NewURLManager(cfg.WSBackend.URLs, logger, "websocket")
+
+	director := func(req *http.Request) {
+		targetURL := urlManager.GetCurrentURL()
+		parsedURL, err := url.Parse(targetURL)
+		if err != nil {
+			logger.Error("Failed to parse target URL", zap.Error(err))
+			return
+		}
+
+		req.URL.Scheme = parsedURL.Scheme
+		req.URL.Host = parsedURL.Host
+		req.Host = parsedURL.Host
+
+		// For infura Extract the project ID from the path
+		projectID := parsedURL.Path[1:]
+		req.URL.Path = fmt.Sprintf("/%s", projectID)
 	}
 
-	// For infura Extract the project ID from the path
-	projectID := backendURL.Path[1:]
-	backendURL.Path = ""
-
-	proxy := httputil.NewSingleHostReverseProxy(backendURL)
-
-	originalDirector := proxy.Director
-	proxy.Director = func(req *http.Request) {
-		originalDirector(req)
-		req.Host = backendURL.Host
-		req.URL.Path = fmt.Sprintf("/%s", projectID)
+	proxy := &httputil.ReverseProxy{
+		Director: director,
 	}
 
 	proxy.Transport = &customTransport{
 		originalTransport: http.DefaultTransport,
 		logger:            logger,
+		urlManager:        urlManager,
 	}
 
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, e error) {
@@ -114,18 +123,20 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	bigcacheStore := bigcache_store.NewBigcache(bigCache)
 	cacheManager := cache.New[[]byte](bigcacheStore)
 
-	ethClient, err := ethclient.Dial(cfg.WSBackend.URL)
+	ethClient, err := ethclient.Dial(cfg.WSBackend.URLs[0])
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to Ethereum client: %v", err)
 	}
 
 	server := &Server{
-		Config:     cfg,
-		Proxy:      proxy,
-		ListenAddr: serverAddr,
-		Cache:      cacheManager,
-		ethClient:  ethClient,
-		logger:     logger,
+		Config:       cfg,
+		Proxy:        proxy,
+		ListenAddr:   serverAddr,
+		Cache:        cacheManager,
+		ethClient:    ethClient,
+		logger:       logger,
+		urlManager:   urlManager,
+		wsURLManager: wsURLManager,
 	}
 
 	// Start tracking the latest block
@@ -138,18 +149,28 @@ func (s *Server) trackLatestBlock() {
 	for {
 		if err := s.subscribeToBlocks(); err != nil {
 			s.logger.Error("Block subscription failed. Retrying in 5 seconds...", zap.Error(err))
+			s.wsURLManager.MarkFailure()
 			time.Sleep(5 * time.Second)
 		}
 	}
 }
 
 func (s *Server) subscribeToBlocks() error {
+	currentURL := s.wsURLManager.GetCurrentURL()
+	ethClient, err := ethclient.Dial(currentURL)
+	if err != nil {
+		return fmt.Errorf("failed to connect to Ethereum client: %v", err)
+	}
+	defer ethClient.Close()
+
 	headers := make(chan *types.Header)
-	sub, err := s.ethClient.SubscribeNewHead(context.Background(), headers)
+	sub, err := ethClient.SubscribeNewHead(context.Background(), headers)
 	if err != nil {
 		return fmt.Errorf("failed to subscribe to new headers: %v", err)
 	}
 	defer sub.Unsubscribe()
+
+	s.wsURLManager.MarkSuccess()
 
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -164,7 +185,7 @@ func (s *Server) subscribeToBlocks() error {
 				"number", header.Number.Uint64(),
 			)
 		case <-ticker.C:
-			block, err := s.ethClient.BlockByNumber(context.Background(), nil)
+			block, err := ethClient.BlockByNumber(context.Background(), nil)
 			if err != nil {
 				s.logger.Error("Failed to fetch latest block", zap.Error(err))
 			} else {
@@ -182,7 +203,7 @@ func (s *Server) Start() {
 
 	s.logger.Infow("Starting proxy server",
 		"address", s.ListenAddr,
-		"backend", s.Config.Backend.URL,
+		"backends", s.Config.Backend.URLs,
 	)
 	if err := http.ListenAndServe(s.ListenAddr, nil); err != nil {
 		s.logger.Fatal("Failed to start server", zap.Error(err))
@@ -276,7 +297,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Create a new request to send to the backend
-		backendReq, err := http.NewRequest("POST", s.Config.Backend.URL, bytes.NewBuffer(backendBodyBytes))
+		backendReq, err := http.NewRequest("POST", s.urlManager.GetCurrentURL(), bytes.NewBuffer(backendBodyBytes))
 		if err != nil {
 			s.logger.Error("Error creating backend request", zap.Error(err))
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
@@ -414,7 +435,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	w.Write(responseBytes)
+	if _, err := w.Write(responseBytes); err != nil {
+		s.logger.Error("Error writing response", zap.Error(err))
+		return
+	}
 }
 
 func hashParams(params interface{}) string {
@@ -459,19 +483,24 @@ func NewResponseRecorder() *responseRecorder {
 type customTransport struct {
 	originalTransport http.RoundTripper
 	logger            *zap.SugaredLogger
+	urlManager        *URLManager
 }
 
 func (t *customTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp, err := t.originalTransport.RoundTrip(req)
 	if err != nil {
+		// Network error - mark failure and rotate URL
+		t.urlManager.MarkFailure()
 		return nil, err
 	}
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		resp.Body = io.NopCloser(bytes.NewBuffer(body))
-		t.logger.Error("Backend error", zap.Int("status", resp.StatusCode), zap.String("body", string(body)))
+	if resp.StatusCode == http.StatusTooManyRequests ||
+		(resp.StatusCode >= 500 && resp.StatusCode < 600) {
+		// Rate limit or server error - mark failure and rotate URL
+		t.urlManager.MarkFailure()
+	} else {
+		// Success - mark success to keep using current URL
+		t.urlManager.MarkSuccess()
 	}
 
 	return resp, nil

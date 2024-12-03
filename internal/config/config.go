@@ -24,7 +24,7 @@ type ServerConfig struct {
 }
 
 type BackendConfig struct {
-	URL string `yaml:"url" envconfig:"BACKEND_URL"`
+	URLs []string `yaml:"urls" envconfig:"BACKEND_URLS"`
 }
 
 type BlockchainConfig struct {
@@ -62,10 +62,10 @@ var globalConfig = &Config{
 		GasFeeTTL:     10 * time.Second,
 	},
 	Backend: BackendConfig{
-		URL: "https://mainnet.infura.io/v3/YOUR_INFURA_PROJECT_ID",
+		URLs: []string{"https://mainnet.infura.io/v3/YOUR_INFURA_PROJECT_ID"},
 	},
 	WSBackend: BackendConfig{
-		URL: "wss://mainnet.infura.io/ws/v3/YOUR_INFURA_PROJECT_ID",
+		URLs: []string{"wss://mainnet.infura.io/ws/v3/YOUR_INFURA_PROJECT_ID"},
 	},
 	Logging: LoggingConfig{
 		Level:          "info",
@@ -107,8 +107,8 @@ func Load(configFile string) (*Config, error) {
 	}
 
 	// Validate required configurations
-	if globalConfig.Backend.URL == "" {
-		return nil, fmt.Errorf("backend URL must be provided")
+	if len(globalConfig.Backend.URLs) == 0 {
+		return nil, fmt.Errorf("backend URLs must be provided")
 	}
 
 	return globalConfig, nil
