@@ -489,20 +489,54 @@ type customTransport struct {
 func (t *customTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp, err := t.originalTransport.RoundTrip(req)
 	if err != nil {
-		// Network error - mark failure and rotate URL
+		t.logger.Errorw("Network error during request",
+			"error", err,
+			"url", req.URL.String(),
+		)
 		t.urlManager.MarkFailure()
 		return nil, err
 	}
 
-	if resp.StatusCode == http.StatusTooManyRequests ||
-		(resp.StatusCode >= 500 && resp.StatusCode < 600) {
-		// Rate limit or server error - mark failure and rotate URL
+	// Read and inspect response body for JSON-RPC errors
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.logger.Errorw("Failed to read response body",
+			"error", err,
+			"status", resp.StatusCode,
+		)
 		t.urlManager.MarkFailure()
-	} else {
-		// Success - mark success to keep using current URL
-		t.urlManager.MarkSuccess()
+		return nil, err
 	}
 
+	// Restore response body for downstream handlers
+	resp.Body = io.NopCloser(bytes.NewBuffer(body))
+
+	// Check for HTTP status errors
+	if resp.StatusCode == http.StatusTooManyRequests ||
+		(resp.StatusCode >= 500 && resp.StatusCode < 600) {
+		t.logger.Warnw("Backend error response",
+			"status", resp.StatusCode,
+			"url", req.URL.String(),
+		)
+		t.urlManager.MarkFailure()
+		return resp, nil
+	}
+
+	// Check for JSON-RPC errors
+	var jsonResp map[string]interface{}
+	if err := json.Unmarshal(body, &jsonResp); err == nil {
+		if errObj, hasError := jsonResp["error"]; hasError && errObj != nil {
+			t.logger.Warnw("JSON-RPC error response",
+				"error", errObj,
+				"url", req.URL.String(),
+			)
+			t.urlManager.MarkFailure()
+			return resp, nil
+		}
+	}
+
+	// Success case
+	t.urlManager.MarkSuccess()
 	return resp, nil
 }
 
