@@ -416,8 +416,76 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Before marshaling the responses, convert them to have string keys
-	for i, resp := range responses {
-		responses[i] = convertToStringKeys(resp)
+	for i := 0; i < len(responses); i++ {
+		responses[i] = convertToStringKeys(responses[i])
+
+		// Check for errors in the response
+		if respMap, ok := responses[i].(map[string]interface{}); ok {
+			if errorObj, hasError := respMap["error"].(map[string]interface{}); hasError {
+				// Extract error details
+				errorCode, _ := errorObj["code"].(float64)
+				errorMessage, _ := errorObj["message"].(string)
+				errorDetails, _ := errorObj["details"].(string)
+
+				// Check for rate limit errors
+				if errorCode == 429 ||
+					strings.Contains(strings.ToLower(errorMessage), "too many requests") ||
+					strings.Contains(strings.ToLower(errorDetails), "throughput limit") {
+
+					s.logger.Warnw("Rate limit exceeded, retrying request with new backend",
+						"error_code", errorCode,
+						"error_message", errorMessage,
+						"error_details", errorDetails,
+					)
+					s.urlManager.MarkFailure()
+
+					// Get the original request that needs to be retried
+					req := uncachedRequestsByID[uncachedRequestIDs[i]]
+
+					// Create a new request to send to the backend
+					backendBodyBytes, err := json.Marshal([]map[string]interface{}{req})
+					if err != nil {
+						s.logger.Error("Error marshaling retry request", zap.Error(err))
+						continue
+					}
+
+					// Create a new request with the new URL
+					backendReq, err := http.NewRequest("POST", s.urlManager.GetCurrentURL(), bytes.NewBuffer(backendBodyBytes))
+					if err != nil {
+						s.logger.Error("Error creating retry request", zap.Error(err))
+						continue
+					}
+					backendReq.Header = r.Header.Clone()
+
+					// Send the request to the new backend
+					time.Sleep(1 * time.Second)
+					client := &http.Client{}
+					resp, err := client.Do(backendReq)
+					if err != nil {
+						s.logger.Error("Error sending retry request", zap.Error(err))
+						continue
+					}
+					defer resp.Body.Close()
+
+					// Read and process the retry response
+					responseBody, err := io.ReadAll(resp.Body)
+					if err != nil {
+						s.logger.Error("Error reading retry response", zap.Error(err))
+						continue
+					}
+
+					var retryResponse interface{}
+					if err := json.Unmarshal(responseBody, &retryResponse); err != nil {
+						s.logger.Error("Error unmarshaling retry response", zap.Error(err))
+						continue
+					}
+
+					// Update the response with the retry result
+					responses[i] = retryResponse
+					continue
+				}
+			}
+		}
 	}
 
 	// Assemble and send the batch response
@@ -487,57 +555,125 @@ type customTransport struct {
 }
 
 func (t *customTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	resp, err := t.originalTransport.RoundTrip(req)
-	if err != nil {
-		t.logger.Errorw("Network error during request",
-			"error", err,
-			"url", req.URL.String(),
-		)
-		t.urlManager.MarkFailure()
-		return nil, err
-	}
+	var shouldRetry bool
+	var lastResp *http.Response
 
-	// Read and inspect response body for JSON-RPC errors
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.logger.Errorw("Failed to read response body",
-			"error", err,
-			"status", resp.StatusCode,
-		)
-		t.urlManager.MarkFailure()
-		return nil, err
-	}
+	for attempt := 0; attempt <= 1; attempt++ { // Max 1 retry
+		// Update request URL with current backend URL for each attempt
+		targetURL := t.urlManager.GetCurrentURL()
+		parsedURL, err := url.Parse(targetURL)
+		if err != nil {
+			t.logger.Error("Failed to parse target URL", zap.Error(err))
+			return nil, err
+		}
 
-	// Restore response body for downstream handlers
-	resp.Body = io.NopCloser(bytes.NewBuffer(body))
+		req.URL.Scheme = parsedURL.Scheme
+		req.URL.Host = parsedURL.Host
+		req.Host = parsedURL.Host
 
-	// Check for HTTP status errors
-	if resp.StatusCode == http.StatusTooManyRequests ||
-		(resp.StatusCode >= 500 && resp.StatusCode < 600) {
-		t.logger.Warnw("Backend error response",
-			"status", resp.StatusCode,
-			"url", req.URL.String(),
-		)
-		t.urlManager.MarkFailure()
-		return resp, nil
-	}
+		// For infura Extract the project ID from the path
+		projectID := parsedURL.Path[1:]
+		req.URL.Path = fmt.Sprintf("/%s", projectID)
 
-	// Check for JSON-RPC errors
-	var jsonResp map[string]interface{}
-	if err := json.Unmarshal(body, &jsonResp); err == nil {
-		if errObj, hasError := jsonResp["error"]; hasError && errObj != nil {
-			t.logger.Warnw("JSON-RPC error response",
-				"error", errObj,
+		resp, err := t.originalTransport.RoundTrip(req)
+		if err != nil {
+			t.logger.Errorw("Network error during request",
+				"error", err,
 				"url", req.URL.String(),
 			)
 			t.urlManager.MarkFailure()
-			return resp, nil
+			return nil, err
 		}
+		lastResp = resp
+
+		// Read and inspect response body for JSON-RPC errors
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.logger.Errorw("Failed to read response body",
+				"error", err,
+				"status", resp.StatusCode,
+			)
+			t.urlManager.MarkFailure()
+			return nil, err
+		}
+
+		// Restore response body for downstream handlers
+		resp.Body = io.NopCloser(bytes.NewBuffer(body))
+
+		// Check for HTTP status errors
+		if resp.StatusCode == http.StatusTooManyRequests ||
+			(resp.StatusCode >= 500 && resp.StatusCode < 600) {
+			t.logger.Warnw("Backend error response",
+				"status", resp.StatusCode,
+				"url", req.URL.String(),
+			)
+			t.urlManager.MarkFailure()
+		}
+
+		// Attempt to parse the response as a batch
+		var batchResp []map[string]interface{}
+		if err := json.Unmarshal(body, &batchResp); err != nil {
+			// If not a batch, try single response
+			var singleResp map[string]interface{}
+			if err := json.Unmarshal(body, &singleResp); err != nil {
+				t.logger.Error("Error unmarshaling response", zap.Error(err))
+				return resp, nil
+			}
+			batchResp = []map[string]interface{}{singleResp}
+		}
+
+		shouldRetry = false
+		// Iterate through each JSON-RPC response object
+		for _, jsonResp := range batchResp {
+			if errorObj, hasError := jsonResp["error"].(map[string]interface{}); hasError {
+				errorCodeFloat, ok := errorObj["code"].(float64)
+				if !ok {
+					t.logger.Warnw("Invalid error code type in backend response",
+						"error_obj", errorObj,
+						"url", req.URL.String(),
+					)
+					continue
+				}
+				errorCode := int(errorCodeFloat)
+
+				errorMessage, _ := errorObj["message"].(string)
+				errorDetails, _ := errorObj["details"].(string)
+
+				if errorCode == 429 ||
+					strings.Contains(strings.ToLower(errorMessage), "too many requests") ||
+					strings.Contains(strings.ToLower(errorDetails), "throughput limit") {
+
+					t.logger.Warnw("Rate limit exceeded, will retry with new backend",
+						"error_code", errorCode,
+						"error_message", errorMessage,
+						"error_details", errorDetails,
+						"url", req.URL.String(),
+						"attempt", attempt+1,
+					)
+					t.urlManager.MarkFailure()
+					shouldRetry = true
+					break
+				} else {
+					t.logger.Warnw("JSON-RPC error response",
+						"error_code", errorCode,
+						"error_message", errorMessage,
+						"error_details", errorDetails,
+						"url", req.URL.String(),
+					)
+				}
+			}
+		}
+
+		if !shouldRetry {
+			t.urlManager.MarkSuccess()
+			return lastResp, nil
+		}
+
+		// Wait before retry
+		time.Sleep(1 * time.Second)
 	}
 
-	// Success case
-	t.urlManager.MarkSuccess()
-	return resp, nil
+	return lastResp, nil
 }
 
 func (s *Server) loggingMiddleware(next http.HandlerFunc) http.HandlerFunc {
