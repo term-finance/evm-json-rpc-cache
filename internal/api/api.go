@@ -555,125 +555,23 @@ type customTransport struct {
 }
 
 func (t *customTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	var shouldRetry bool
-	var lastResp *http.Response
-
-	for attempt := 0; attempt <= 1; attempt++ { // Max 1 retry
-		// Update request URL with current backend URL for each attempt
-		targetURL := t.urlManager.GetCurrentURL()
-		parsedURL, err := url.Parse(targetURL)
-		if err != nil {
-			t.logger.Error("Failed to parse target URL", zap.Error(err))
-			return nil, err
-		}
-
-		req.URL.Scheme = parsedURL.Scheme
-		req.URL.Host = parsedURL.Host
-		req.Host = parsedURL.Host
-
-		// For infura Extract the project ID from the path
-		projectID := parsedURL.Path[1:]
-		req.URL.Path = fmt.Sprintf("/%s", projectID)
-
-		resp, err := t.originalTransport.RoundTrip(req)
-		if err != nil {
-			t.logger.Errorw("Network error during request",
-				"error", err,
-				"url", req.URL.String(),
-			)
-			t.urlManager.MarkFailure()
-			return nil, err
-		}
-		lastResp = resp
-
-		// Read and inspect response body for JSON-RPC errors
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			t.logger.Errorw("Failed to read response body",
-				"error", err,
-				"status", resp.StatusCode,
-			)
-			t.urlManager.MarkFailure()
-			return nil, err
-		}
-
-		// Restore response body for downstream handlers
-		resp.Body = io.NopCloser(bytes.NewBuffer(body))
-
-		// Check for HTTP status errors
-		if resp.StatusCode == http.StatusTooManyRequests ||
-			(resp.StatusCode >= 500 && resp.StatusCode < 600) {
-			t.logger.Warnw("Backend error response",
-				"status", resp.StatusCode,
-				"url", req.URL.String(),
-			)
-			t.urlManager.MarkFailure()
-		}
-
-		// Attempt to parse the response as a batch
-		var batchResp []map[string]interface{}
-		if err := json.Unmarshal(body, &batchResp); err != nil {
-			// If not a batch, try single response
-			var singleResp map[string]interface{}
-			if err := json.Unmarshal(body, &singleResp); err != nil {
-				t.logger.Error("Error unmarshaling response", zap.Error(err))
-				return resp, nil
-			}
-			batchResp = []map[string]interface{}{singleResp}
-		}
-
-		shouldRetry = false
-		// Iterate through each JSON-RPC response object
-		for _, jsonResp := range batchResp {
-			if errorObj, hasError := jsonResp["error"].(map[string]interface{}); hasError {
-				errorCodeFloat, ok := errorObj["code"].(float64)
-				if !ok {
-					t.logger.Warnw("Invalid error code type in backend response",
-						"error_obj", errorObj,
-						"url", req.URL.String(),
-					)
-					continue
-				}
-				errorCode := int(errorCodeFloat)
-
-				errorMessage, _ := errorObj["message"].(string)
-				errorDetails, _ := errorObj["details"].(string)
-
-				if errorCode == 429 ||
-					strings.Contains(strings.ToLower(errorMessage), "too many requests") ||
-					strings.Contains(strings.ToLower(errorDetails), "throughput limit") {
-
-					t.logger.Warnw("Rate limit exceeded, will retry with new backend",
-						"error_code", errorCode,
-						"error_message", errorMessage,
-						"error_details", errorDetails,
-						"url", req.URL.String(),
-						"attempt", attempt+1,
-					)
-					t.urlManager.MarkFailure()
-					shouldRetry = true
-					break
-				} else {
-					t.logger.Warnw("JSON-RPC error response",
-						"error_code", errorCode,
-						"error_message", errorMessage,
-						"error_details", errorDetails,
-						"url", req.URL.String(),
-					)
-				}
-			}
-		}
-
-		if !shouldRetry {
-			t.urlManager.MarkSuccess()
-			return lastResp, nil
-		}
-
-		// Wait before retry
-		time.Sleep(1 * time.Second)
+	resp, err := t.originalTransport.RoundTrip(req)
+	if err != nil {
+		// Network error - mark failure and rotate URL
+		t.urlManager.MarkFailure()
+		return nil, err
 	}
 
-	return lastResp, nil
+	if resp.StatusCode == http.StatusTooManyRequests ||
+		(resp.StatusCode >= 500 && resp.StatusCode < 600) {
+		// Rate limit or server error - mark failure and rotate URL
+		t.urlManager.MarkFailure()
+	} else {
+		// Success - mark success to keep using current URL
+		t.urlManager.MarkSuccess()
+	}
+
+	return resp, nil
 }
 
 func (s *Server) loggingMiddleware(next http.HandlerFunc) http.HandlerFunc {
