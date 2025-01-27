@@ -17,7 +17,7 @@ jobs:
           fetch-depth: 0
       - uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::491794280232:role/term-finance-infra
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           role-session-name: evm-json-rpc-cache-github-workflow
           aws-region: us-west-1
       - id: login-ecr
