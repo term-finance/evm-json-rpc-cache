@@ -19,7 +19,7 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           role-session-name: evm-json-rpc-cache-github-workflow
-          aws-region: us-west-1
+          aws-region: us-west-2
       - id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
       - id: metadata
